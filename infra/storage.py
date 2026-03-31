@@ -10,29 +10,56 @@ from memory.experience_pool import ExperienceRecord
 
 
 class JsonlLogger:
-    """追加写入式 JSONL 日志器 用于 状态/动作 事件."""
+    """追加写入式 JSONL 日志器 用于 状态/动作 事件.
+
+    Uses a persistent file handle with explicit flush to avoid repeated
+    open/close system calls on every log() invocation (significant I/O
+    overhead on Windows NTFS with hundreds of generations).
+    """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.path.open("a", encoding="utf-8")
 
     def log(self, event: dict[str, Any]) -> None:
         """将一个事件写成单行 JSON 对象."""
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        self._file.write(json.dumps(event, ensure_ascii=False) + "\n")
+        self._file.flush()
+
+    def close(self) -> None:
+        """Release the underlying file handle."""
+        if hasattr(self, "_file") and not self._file.closed:
+            self._file.close()
+
+    def __del__(self) -> None:
+        self.close()
 
 
 class ExperienceJsonlLogger:
-    """持久化 experience tuples 到 JSONL 用于 离线分析."""
+    """持久化 experience tuples 到 JSONL 用于 离线分析.
+
+    Uses a persistent file handle with explicit flush for the same
+    I/O performance reasons as JsonlLogger.
+    """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.path.open("a", encoding="utf-8")
 
     def log(self, record: ExperienceRecord) -> None:
         """Write 一个 ``ExperienceRecord`` 作为 一个 JSONL line."""
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
+        self._file.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
+        self._file.flush()
+
+    def close(self) -> None:
+        """Release the underlying file handle."""
+        if hasattr(self, "_file") and not self._file.closed:
+            self._file.close()
+
+    def __del__(self) -> None:
+        self.close()
 
 
 class CsvExporter:

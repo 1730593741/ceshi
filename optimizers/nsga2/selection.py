@@ -26,43 +26,48 @@ def dominates(lhs: Individual, rhs: Individual) -> bool:
 
 
 def non_dominated_sort(individuals: list[Individual]) -> list[list[Individual]]:
-    """将个体分组为 Pareto 前沿 (rank 0, 1, ...)."""
+    """将个体分组为 Pareto 前沿 (rank 0, 1, ...).
+
+    Uses integer indices instead of ``id()`` to avoid key collisions when
+    the same Individual object is referenced multiple times in the list.
+    """
     if not individuals:
         return []
 
-    domination_count = {id(ind): 0 for ind in individuals}
-    dominates_list: dict[int, list[Individual]] = {id(ind): [] for ind in individuals}
-    first_front: list[Individual] = []
+    n = len(individuals)
+    domination_count = [0] * n
+    dominates_list: list[list[int]] = [[] for _ in range(n)]
+    first_front: list[int] = []
 
-    for i, p in enumerate(individuals):
-        for q in individuals[i + 1 :]:
-            if dominates(p, q):
-                dominates_list[id(p)].append(q)
-                domination_count[id(q)] += 1
-            elif dominates(q, p):
-                dominates_list[id(q)].append(p)
-                domination_count[id(p)] += 1
+    for i in range(n):
+        for j in range(i + 1, n):
+            if dominates(individuals[i], individuals[j]):
+                dominates_list[i].append(j)
+                domination_count[j] += 1
+            elif dominates(individuals[j], individuals[i]):
+                dominates_list[j].append(i)
+                domination_count[i] += 1
 
-    for ind in individuals:
-        if domination_count[id(ind)] == 0:
-            ind.rank = 0
-            first_front.append(ind)
+    for i in range(n):
+        if domination_count[i] == 0:
+            individuals[i].rank = 0
+            first_front.append(i)
 
-    fronts: list[list[Individual]] = [first_front]
+    front_indices: list[list[int]] = [first_front]
     level = 0
-    while level < len(fronts) and fronts[level]:
-        next_front: list[Individual] = []
-        for p in fronts[level]:
-            for q in dominates_list[id(p)]:
-                domination_count[id(q)] -= 1
-                if domination_count[id(q)] == 0:
-                    q.rank = level + 1
-                    next_front.append(q)
+    while level < len(front_indices) and front_indices[level]:
+        next_front: list[int] = []
+        for p_idx in front_indices[level]:
+            for q_idx in dominates_list[p_idx]:
+                domination_count[q_idx] -= 1
+                if domination_count[q_idx] == 0:
+                    individuals[q_idx].rank = level + 1
+                    next_front.append(q_idx)
         if next_front:
-            fronts.append(next_front)
+            front_indices.append(next_front)
         level += 1
 
-    return fronts
+    return [[individuals[i] for i in front] for front in front_indices]
 
 
 

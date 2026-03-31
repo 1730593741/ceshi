@@ -15,6 +15,7 @@ _MATCHED_CONFIGS: dict[str, str] = {
     "rule_control": "experiments/configs/rule_control.yaml",
     "mock_llm": "experiments/configs/mock_llm.yaml",
     "real_llm": "experiments/configs/real_llm.yaml",
+    "hybrid_llm": "experiments/configs/hybrid_llm.yaml",
 }
 
 _BENCHMARK_CONFIGS: dict[str, str] = {
@@ -22,6 +23,8 @@ _BENCHMARK_CONFIGS: dict[str, str] = {
     "dwta_small": "experiments/configs/dwta_small.yaml",
     "dwta_medium": "experiments/configs/dwta_medium.yaml",
     "dwta_hard": "experiments/configs/dwta_hard_realworld.yaml",
+    "dwta_large_static": "experiments/configs/dwta_large_static.yaml",
+    "dwta_hard_realworld": "experiments/configs/dwta_hard_realworld.yaml",
 }
 
 
@@ -57,6 +60,15 @@ def _build_matched_payload(
     benchmark_payload = _load_yaml(_BENCHMARK_CONFIGS[benchmark])
 
     payload["problem"] = copy.deepcopy(benchmark_payload["problem"])
+
+    # Normalize solver key: benchmark configs may use legacy "optimizer" key.
+    # The caller-supplied generations/population_size always win for matched experiments
+    # (ensuring all methods run under identical optimizer settings).
+    # However, benchmark-specific solver knobs (eta_c, eta_m, local_search_prob, etc.)
+    # are intentionally NOT inherited from the benchmark config so that matched
+    # comparisons use only the method config's defaults — keeping comparisons fair.
+    if "solver" not in payload and "optimizer" in payload:
+        payload["solver"] = payload.pop("optimizer")
     payload.setdefault("solver", {})["seed"] = seed
     payload["solver"]["generations"] = generations
     payload["solver"]["population_size"] = population_size

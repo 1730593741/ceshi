@@ -79,6 +79,12 @@ class RuleControllerConfig:
     feasible_ratio_low: float = 0.55
     diversity_low: float = 0.08
     improvement_threshold: float = 1e-3
+    # --- Bug-fix additions ---
+    stagnation_threshold: int = 3  # consecutive stagnant generations before convergence push
+    recovery_ratio: float = 0.5   # fraction to recover toward initial mutation when delta_hv > 0
+    default_eta_c: float = 15.0   # used when eta_c is None but caps support it
+    default_eta_m: float = 20.0   # used when eta_m is None but caps support it
+    default_local_search_prob: float = 0.0  # used when local_search_prob is None but supported
 
     def __post_init__(self) -> None:
         """Validate controller bounds to protect runtime experiments."""
@@ -202,7 +208,7 @@ class RuleBasedController:
     - low feasibility -> push the search toward safer, more repair-heavy moves;
     - low diversity -> increase exploration pressure;
     - stagnation / weak HV progress -> strengthen convergence pressure;
-    - otherwise keep the current balance.
+    - otherwise keep the current balance (with diversity recovery when needed).
     """
 
     def __init__(self, config: RuleControllerConfig) -> None:
@@ -211,6 +217,9 @@ class RuleBasedController:
         self.event_triggered_control = config.event_triggered_control
         self.event_control_cooldown = config.event_control_cooldown
         self.forced_control_on_major_event = config.forced_control_on_major_event
+        # Remember the initial mutation/crossover values so we can recover toward them.
+        self._initial_mutation: float | None = None
+        self._initial_crossover: float | None = None
 
     def decide(
         self,
@@ -247,8 +256,31 @@ class RuleBasedController:
             msg = "Either current_params or both current_mutation/current_crossover must be provided"
             raise ValueError(msg)
         capabilities = capabilities or OperatorCapabilities()
+
+        # Snapshot initial values on first call so recovery has a target.
+        if self._initial_mutation is None:
+            self._initial_mutation = mutation
+        if self._initial_crossover is None:
+            self._initial_crossover = crossover
+
         control_state = ControlState.MAINTAIN_BALANCE
         reason_details: list[str] = []
+
+        # --- Initialise optional params with defaults when supported but None ---
+        eta_c = current_params.eta_c if current_params else None
+        eta_m = current_params.eta_m if current_params else None
+        repair_prob = current_params.repair_prob if current_params else None
+        local_search_prob = current_params.local_search_prob if current_params else None
+
+        if capabilities.supports_eta_c and eta_c is None:
+            eta_c = self.config.default_eta_c
+            reason_details.append("init_eta_c_default")
+        if capabilities.supports_eta_m and eta_m is None:
+            eta_m = self.config.default_eta_m
+            reason_details.append("init_eta_m_default")
+        if capabilities.supports_local_search_prob and local_search_prob is None:
+            local_search_prob = self.config.default_local_search_prob
+            reason_details.append("init_local_search_default")
 
         # First decide the high-level control intent from the observed state.
         if state.feasible_ratio < self.config.feasible_ratio_low:
@@ -261,23 +293,51 @@ class RuleBasedController:
             mutation += self.config.mutation_step
             crossover -= self.config.crossover_step
             reason_details.append("diversity_score_below_threshold")
-        elif state.stagnation_len > 0 or state.delta_hv <= self.config.improvement_threshold:
+        elif state.stagnation_len >= self.config.stagnation_threshold:
+            # Bug-fix: only trigger convergence after N consecutive stagnant
+            # generations, not on any single-generation dip.
             control_state = ControlState.INCREASE_CONVERGENCE
             mutation -= self.config.mutation_step * 0.5
             crossover += self.config.crossover_step * 0.5
-            reason_details.append("stagnation_or_low_hv_progress")
+            reason_details.append(
+                f"stagnation_len({state.stagnation_len})>=threshold({self.config.stagnation_threshold})"
+            )
         else:
+            # Bug-fix: when maintaining balance AND mutation has been pushed below
+            # its initial value, partially recover toward the initial value so that
+            # exploration pressure does not monotonically decay.
             control_state = ControlState.MAINTAIN_BALANCE
-            reason_details.append("metrics_in_expected_range")
+            if state.delta_hv > 0 and mutation < self._initial_mutation:
+                recovery_amount = (self._initial_mutation - mutation) * self.config.recovery_ratio
+                mutation += recovery_amount
+                reason_details.append(
+                    f"diversity_recovery(+{recovery_amount:.4f})"
+                )
+            else:
+                reason_details.append("metrics_in_expected_range")
+
+        # --- eta adjustments tied to convergence/diversity intent ---
+        if capabilities.supports_eta_c and eta_c is not None:
+            if control_state == ControlState.INCREASE_CONVERGENCE:
+                eta_c += self.config.eta_c_step  # larger eta → smaller perturbation
+                reason_details.append("raise_eta_c_for_convergence")
+            elif control_state == ControlState.INCREASE_DIVERSITY:
+                eta_c -= self.config.eta_c_step  # smaller eta → larger perturbation
+                reason_details.append("lower_eta_c_for_diversity")
+            eta_c = _clip(eta_c, self.config.min_eta_c, self.config.max_eta_c)
+
+        if capabilities.supports_eta_m and eta_m is not None:
+            if control_state == ControlState.INCREASE_CONVERGENCE:
+                eta_m += self.config.eta_m_step
+                reason_details.append("raise_eta_m_for_convergence")
+            elif control_state == ControlState.INCREASE_DIVERSITY:
+                eta_m -= self.config.eta_m_step
+                reason_details.append("lower_eta_m_for_diversity")
+            eta_m = _clip(eta_m, self.config.min_eta_m, self.config.max_eta_m)
 
         # Then clip values into the safe experimental operating range.
         mutation = _clip(mutation, self.config.min_mutation_prob, self.config.max_mutation_prob)
         crossover = _clip(crossover, self.config.min_crossover_prob, self.config.max_crossover_prob)
-
-        eta_c = current_params.eta_c if current_params else None
-        eta_m = current_params.eta_m if current_params else None
-        repair_prob = current_params.repair_prob if current_params else None
-        local_search_prob = current_params.local_search_prob if current_params else None
 
         # Apply optional parameter adjustments only when the optimizer supports
         # the corresponding operator dimension.
@@ -289,6 +349,17 @@ class RuleBasedController:
                 repair_prob -= self.config.repair_step * 0.5
                 reason_details.append("lower_repair_for_exploration")
             repair_prob = _clip(repair_prob, self.config.min_repair_prob, self.config.max_repair_prob)
+
+        if capabilities.supports_local_search_prob and local_search_prob is not None:
+            if control_state == ControlState.INCREASE_CONVERGENCE:
+                local_search_prob += self.config.local_search_step
+                reason_details.append("raise_local_search_for_convergence")
+            elif control_state == ControlState.INCREASE_DIVERSITY:
+                local_search_prob -= self.config.local_search_step * 0.5
+                reason_details.append("lower_local_search_for_diversity")
+            local_search_prob = _clip(
+                local_search_prob, self.config.min_local_search_prob, self.config.max_local_search_prob
+            )
 
         reason = control_state.value
         reason_detail = ";".join(reason_details)
@@ -314,7 +385,7 @@ class RuleBasedController:
 
 
 class LLMChainController:
-    """Composable controller built from analyst -> strategist -> actuator."""
+    """Composable controller built from analyst -> actuator (strategist merged into analyst)."""
 
     def __init__(
         self,
@@ -325,7 +396,7 @@ class LLMChainController:
         event_control_cooldown: int = 0,
         forced_control_on_major_event: bool = False,
         analyst: Any,
-        strategist: Any,
+        strategist: Any = None,
         actuator: Any,
     ) -> None:
         if control_interval <= 0:
@@ -338,7 +409,6 @@ class LLMChainController:
         self.event_control_cooldown = event_control_cooldown
         self.forced_control_on_major_event = forced_control_on_major_event
         self.analyst = analyst
-        self.strategist = strategist
         self.actuator = actuator
 
     def decide(
@@ -346,18 +416,94 @@ class LLMChainController:
         *,
         observation: Observation,
     ) -> ControlAction:
-        """Run the full reasoning chain and return a structured action."""
+        """Run the two-step reasoning chain (analyst -> actuator) and return a structured action.
+
+        The Strategist LLM call is eliminated: Analyst now outputs both diagnosis
+        and strategy intent in a single call. StrategyDecision is constructed
+        from AnalysisResult with zero additional network round-trips.
+        """
+        from llm.strategist import StrategyDecision
+
         diagnosis = self.analyst.analyze(
             state=observation.state,
             recent_experiences=observation.recent_experiences,
         )
-        strategy = self.strategist.plan(diagnosis)
+        strategy = StrategyDecision.from_analysis(diagnosis)
         return self.actuator.act(
             generation=observation.state.generation,
             strategy=strategy,
             current_params=observation.current_params,
             capabilities=observation.capabilities,
         )
+
+
+class HybridController:
+    """混合控制器：默认使用 RuleBasedController，在事件触发或长期停滞时唤醒 LLMChainController.
+
+    设计思路：
+    - 绝大多数代使用轻量级 rule_control（零 LLM 延迟）。
+    - 当 observation 的 trigger_type == "event"（环境巨变）或
+      state.stagnation_len >= stagnation_llm_threshold 时，切换到 LLM 推理。
+    - 这样在静态/平稳场景下性能接近 rule_control，
+      在动态/停滞场景下获得 real_llm 的自适应优势。
+    """
+
+    def __init__(
+        self,
+        *,
+        rule_controller: RuleBasedController,
+        llm_controller: LLMChainController,
+        control_interval: int,
+        stagnation_llm_threshold: int = 5,
+        event_triggered_control: bool = True,
+        event_control_cooldown: int = 0,
+        forced_control_on_major_event: bool = True,
+    ) -> None:
+        if control_interval <= 0:
+            raise ValueError("control_interval must be > 0")
+        self.rule_controller = rule_controller
+        self.llm_controller = llm_controller
+        self.control_interval = control_interval
+        self.stagnation_llm_threshold = max(1, stagnation_llm_threshold)
+        self.event_triggered_control = event_triggered_control
+        self.event_control_cooldown = event_control_cooldown
+        self.forced_control_on_major_event = forced_control_on_major_event
+        # Expose experience_lookback for ClosedLoopRunner._recent_experiences
+        self.experience_lookback = llm_controller.experience_lookback
+        # 统计 LLM 被唤醒的次数（用于日志/分析）
+        self.llm_wakeup_count: int = 0
+        self.rule_decision_count: int = 0
+
+    def decide(self, *, observation: Observation) -> ControlAction:
+        """根据触发类型和停滞状态选择 rule 或 llm 控制器."""
+        use_llm = False
+        wakeup_reasons: list[str] = []
+
+        # 条件 1: 事件触发（环境巨变）
+        if observation.trigger_type == "event":
+            use_llm = True
+            wakeup_reasons.append(f"event_triggered(id={observation.trigger_event_id})")
+
+        # 条件 2: 长时间停滞
+        if observation.state.stagnation_len >= self.stagnation_llm_threshold:
+            use_llm = True
+            wakeup_reasons.append(
+                f"stagnation({observation.state.stagnation_len})>="
+                f"threshold({self.stagnation_llm_threshold})"
+            )
+
+        wakeup_reason = "+".join(wakeup_reasons)
+
+        if use_llm:
+            self.llm_wakeup_count += 1
+            action = self.llm_controller.decide(observation=observation)
+            action.reason_detail = f"hybrid_llm_wakeup:{wakeup_reason};{action.reason_detail}"
+            return action
+
+        self.rule_decision_count += 1
+        action = self.rule_controller.decide(observation=observation)
+        action.reason_detail = f"hybrid_rule;{action.reason_detail}"
+        return action
 
 
 @dataclass(slots=True)
@@ -459,7 +605,7 @@ class ClosedLoopRunner:
 
             # Do not schedule a new action after the final generation because no
             # subsequent state would exist to complete the transition.
-            trigger_type, cooldown_skipped = self._resolve_trigger(
+            trigger_type, cooldown_skipped, suppressed_trigger = self._resolve_trigger(
                 generation=generation,
                 generations=generations,
                 runtime_events=runtime_events,
@@ -469,7 +615,7 @@ class ClosedLoopRunner:
             if cooldown_skipped:
                 self._log_control_skip(
                     generation=generation,
-                    trigger_type=trigger_type,
+                    trigger_type=suppressed_trigger,
                     event_id=latest_event_id,
                     last_control_generation=last_control_generation,
                 )
@@ -569,10 +715,28 @@ class ClosedLoopRunner:
         generations: int,
         runtime_events: list[dict[str, Any]],
         last_control_generation: int | None,
-    ) -> tuple[str | None, bool]:
-        """Determine whether controller should run and record cooldown skips."""
+    ) -> tuple[str | None, bool, str | None]:
+        """Determine whether controller should run and record cooldown skips.
+
+        Returns a 3-tuple of (trigger_type, cooldown_skipped, suppressed_trigger):
+        - trigger_type: the trigger to act on (None if skipped)
+        - cooldown_skipped: True if a trigger was suppressed by cooldown
+        - suppressed_trigger: the would-be trigger type when cooldown suppresses
+
+        The final generation is intentionally excluded from controller triggering
+        because no subsequent state would exist to close the experience transition.
+        """
         if generation >= generations:
-            return None, False
+            periodic_due = generation % self.controller.control_interval == 0
+            event_enabled = bool(getattr(self.controller, "event_triggered_control", False))
+            forced_on_major = bool(getattr(self.controller, "forced_control_on_major_event", False))
+            event_due = bool(runtime_events) and (event_enabled or forced_on_major)
+            if periodic_due or event_due:
+                self._log_final_generation_skip(
+                    generation=generation,
+                    trigger_type="event" if event_due else "periodic",
+                )
+            return None, False, None
 
         periodic_due = generation % self.controller.control_interval == 0
         event_due = False
@@ -583,18 +747,19 @@ class ClosedLoopRunner:
             event_due = True
 
         if not periodic_due and not event_due:
-            return None, False
+            return None, False, None
 
         cooldown = int(getattr(self.controller, "event_control_cooldown", 0))
         if last_control_generation is not None and generation - last_control_generation <= cooldown:
-            preferred = "event" if event_due else "periodic"
-            return preferred, True
+            # Cooldown active: suppress control but record the would-be trigger.
+            suppressed = "event" if event_due else "periodic"
+            return None, True, suppressed
 
         if event_due:
-            return "event", False
+            return "event", False, None
         if periodic_due:
-            return "periodic", False
-        return None, False
+            return "periodic", False, None
+        return None, False, None
 
     def _log_control_skip(
         self,
@@ -615,6 +780,33 @@ class ClosedLoopRunner:
                 "trigger_event_id": event_id,
                 "cooldown_skipped": True,
                 "last_control_generation": last_control_generation,
+            }
+        )
+
+    def _log_final_generation_skip(
+        self,
+        *,
+        generation: int,
+        trigger_type: str,
+    ) -> None:
+        """Log that the final generation suppressed a would-be control trigger.
+
+        Control is intentionally skipped on the last generation because there
+        is no subsequent state to close the experience transition tuple. This
+        event lets post-hoc analysis account for the reduced ``num_actions``
+        count in short experiments (e.g. toy preset with 4 generations).
+        """
+        if self.logger is None:
+            return
+        self.logger.log(
+            {
+                "event": "control_skip",
+                "generation": generation,
+                "trigger_type": trigger_type,
+                "trigger_event_id": None,
+                "cooldown_skipped": False,
+                "skip_reason": "final_generation",
+                "last_control_generation": None,
             }
         )
 

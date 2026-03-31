@@ -13,7 +13,7 @@ import numpy as np
 from eval.metrics import igd, igd_plus, spacing, spread
 from eval.reference_front import build_empirical_reference_front, read_final_front_from_generation_log
 
-_METHODS = ("baseline_nsga2", "rule_control", "mock_llm", "real_llm")
+_METHODS = ("baseline_nsga2", "rule_control", "mock_llm", "real_llm", "hybrid_llm")
 
 
 def _read_json(path: Path) -> dict[str, Any]:

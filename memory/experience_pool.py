@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -25,26 +26,29 @@ class ExperienceRecord:
 
 
 class ExperiencePool:
-    """内存中的滑动窗口存储 用于 recent 控制 experiences."""
+    """内存中的滑动窗口存储 用于 recent 控制 experiences.
+
+    Uses ``collections.deque(maxlen=N)`` for O(1) automatic eviction
+    instead of list slicing which allocates a new list on every overflow.
+    """
 
     def __init__(self, max_size: int = 100) -> None:
         if max_size <= 0:
             raise ValueError("max_size must be > 0")
         self.max_size = max_size
-        self._records: list[ExperienceRecord] = []
+        self._records: deque[ExperienceRecord] = deque(maxlen=max_size)
 
     def append(self, record: ExperienceRecord) -> None:
-        """添加一条经验并执行滑动窗口裁剪."""
+        """添加一条经验; deque 自动丢弃最旧记录."""
         self._records.append(record)
-        overflow = len(self._records) - self.max_size
-        if overflow > 0:
-            self._records = self._records[overflow:]
 
     def recent(self, n: int) -> list[ExperienceRecord]:
         """返回 at most 该 last ``n`` records 在 时间顺序."""
         if n <= 0:
             return []
-        return self._records[-n:]
+        # deque doesn't support negative slicing; convert via islice
+        start = max(0, len(self._records) - n)
+        return list(self._records)[start:]
 
     def get_recent(self, n: int) -> list[ExperienceRecord]:
         """为未来调用方兼容性保留的别名."""
@@ -52,3 +56,4 @@ class ExperiencePool:
 
     def __len__(self) -> int:
         return len(self._records)
+

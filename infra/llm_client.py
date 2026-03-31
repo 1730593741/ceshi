@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -150,8 +151,9 @@ class LLMClient:
                     request=response.request,
                     response=response,
                 )
-        body = response.json()
-        content_text = body["choices"][0]["message"]["content"]
+            # Parse response inside `with` block so underlying resources are guaranteed alive.
+            body = response.json()
+            content_text = body["choices"][0]["message"]["content"]
         return json.loads(_strip_code_fence(content_text))
 
     def _build_http_timeout(self) -> httpx.Timeout:
@@ -176,18 +178,23 @@ class LLMClient:
             if feasible_ratio < 0.6:
                 control_state = "increase_feasibility"
                 reason = "mock_low_feasible_ratio"
+                rationale = "mock: feasibility below threshold; prioritize repair."
             elif diversity_score < 0.12:
                 control_state = "increase_diversity"
                 reason = "mock_low_diversity"
-            elif stagnation_len > 0 or float(state.get("delta_hv", 0.0)) <= 1e-4 or reward_trend < -1e-6:
+                rationale = "mock: diversity too low; increase mutation pressure."
+            elif stagnation_len >= 3 or float(state.get("delta_hv", 0.0)) <= 1e-6 or reward_trend < -1e-6:
                 control_state = "increase_convergence"
                 reason = "mock_stagnation_or_negative_recent_reward"
+                rationale = "mock: stagnation or negative HV trend; strengthen convergence."
             else:
                 control_state = "maintain_balance"
                 reason = "mock_balanced"
+                rationale = "mock: metrics balanced; maintain current parameters."
             return {
                 "control_state": control_state,
                 "reason": reason,
+                "rationale": rationale,
                 "convergence_signal": float(state.get("rank1_ratio", 0.0)),
                 "diversity_signal": diversity_score,
                 "feasibility_signal": feasible_ratio,
@@ -236,9 +243,25 @@ class LLMClient:
 
 
 def _strip_code_fence(text: str) -> str:
+    """Extract JSON content from LLM output that may be wrapped in code fences or prose.
+
+    Handles:
+    - Standard ```json ... ``` fences
+    - Plain ``` ... ``` fences
+    - Raw JSON without fences
+    - JSON embedded in surrounding prose text (regex fallback)
+    """
     stripped = text.strip()
+
+    # Case 1: standard triple-backtick fence
     if stripped.startswith("```") and stripped.endswith("```"):
         lines = stripped.splitlines()
         if len(lines) >= 3:
             return "\n".join(lines[1:-1]).strip()
+
+    # Case 2: regex fallback — extract the first { ... } JSON object
+    match = re.search(r"\{.*\}", stripped, re.DOTALL)
+    if match:
+        return match.group(0)
+
     return stripped

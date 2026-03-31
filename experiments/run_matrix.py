@@ -21,7 +21,7 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 def run_matrix(*, preset: str, output_root: str | Path, include_ablation: bool) -> dict[str, Any]:
     """运行 selected 矩阵 preset 与 返回 manifest payload."""
     if preset not in MATCHED_PRESETS or preset not in ABLATION_PRESETS:
-        raise ValueError(f"Unsupported preset '{preset}'")
+        raise ValueError(f"Unsupported preset '{preset}'; valid choices: {sorted(MATCHED_PRESETS)}")
 
     root = Path(output_root)
     matched = MATCHED_PRESETS[preset]
@@ -77,12 +77,16 @@ def run_matrix(*, preset: str, output_root: str | Path, include_ablation: bool) 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run experiment matrix presets")
-    parser.add_argument("--preset", choices=["toy", "pilot", "paper"], default="toy")
+    parser.add_argument("--preset", choices=list(MATCHED_PRESETS.keys()), default="toy")
     parser.add_argument("--output-root", default="experiments/runs")
     parser.add_argument("--skip-ablation", action="store_true")
     args = parser.parse_args()
 
-    result = run_matrix(preset=args.preset, output_root=args.output_root, include_ablation=not args.skip_ablation)
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = f"{args.output_root}_{timestamp}"
+
+    result = run_matrix(preset=args.preset, output_root=output_path, include_ablation=not args.skip_ablation)
     print(f"wrote manifest: {result['manifest_path']}")
 
 

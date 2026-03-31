@@ -1,14 +1,17 @@
-"""Strategist 角色: map analysis 到 four-状态 控制 意图，并带有 依据."""
+"""Strategist 角色 (deprecated: merged into Analyst).
+
+StrategyDecision 数据类保留供 Actuator 接口使用。
+Strategist LLM 调用已消除 —— Analyst 直接输出完整策略决定，
+本模块仅提供从 AnalysisResult 构造 StrategyDecision 的零开销适配器。
+"""
 
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 from pydantic import BaseModel
 
 from controller.control_semantics import ControlState
-from infra.llm_client import LLMClient
 from llm.analyst import AnalysisResult
 
 logger = logging.getLogger(__name__)
@@ -20,21 +23,29 @@ class StrategyDecision(BaseModel):
     control_state: ControlState
     rationale: str
 
+    @classmethod
+    def from_analysis(cls, diagnosis: AnalysisResult) -> "StrategyDecision":
+        """将 AnalysisResult 直接转换为 StrategyDecision，不产生 LLM 网络往返."""
+        return cls(
+            control_state=diagnosis.control_state,
+            rationale=diagnosis.rationale or diagnosis.reason,
+        )
+
 
 class Strategist:
-    """将 analyst 输出转换为规范的控制状态决策."""
+    """(Deprecated) Strategist LLM 角色已合并入 Analyst.
 
-    def __init__(self, client: LLMClient, prompt_path: str = "llm/prompts/strategist.txt") -> None:
+    保留此类仅为向后兼容。LLMChainController 不再调用 plan()，
+    而是直接从 AnalysisResult 构造 StrategyDecision。
+    """
+
+    def __init__(self, client: object = None, prompt_path: str = "llm/prompts/strategist.txt") -> None:
+        logger.warning(
+            "Strategist LLM role is deprecated and will not make any LLM calls. "
+            "Analysis and strategy are now merged in the Analyst role."
+        )
         self.client = client
-        self.prompt_template = Path(prompt_path).read_text(encoding="utf-8")
 
     def plan(self, diagnosis: AnalysisResult) -> StrategyDecision:
-        payload = {"diagnosis": diagnosis.model_dump(mode="json")}
-        response = self.client.generate_json(task="strategist", payload=payload, prompt_template=self.prompt_template)
-        if not response.content:
-            logger.warning("Strategist hold fallback due to llm error: %s", response.error)
-            return StrategyDecision(control_state=diagnosis.control_state, rationale="fallback_use_analyst_state")
-        decision = StrategyDecision.model_validate(response.content)
-        if response.error:
-            logger.warning("Strategist used fallback mode=%s: %s", response.mode_used, response.error)
-        return decision
+        """(Deprecated) 直接从 diagnosis 透传，不调用 LLM."""
+        return StrategyDecision.from_analysis(diagnosis)

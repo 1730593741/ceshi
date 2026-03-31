@@ -274,6 +274,14 @@ class NSGA2Solver:
 
         dwta_mutation_step = max(1.0, self.config.mutation_prob * 10.0)
 
+        # Cache the compatibility matrix once per generation — snapshot is
+        # stable within a single _make_offspring call.
+        compat_matrix = (
+            self.dwta_live_cache.get_snapshot().compatibility_mask.astype(int).tolist()
+            if self.dwta_live_cache is not None
+            else self.dwta_data.compatibility_matrix
+        )
+
         offspring: list[Individual] = []
         for idx in range(0, len(parents), 2):
             parent_a = parents[idx]
@@ -292,11 +300,7 @@ class NSGA2Solver:
                 child_a,
                 n_weapons=self.dwta_data.n_weapons,
                 n_targets=self.dwta_data.n_targets,
-                compatibility_matrix=(
-                    self.dwta_live_cache.get_snapshot().compatibility_mask.astype(int).tolist()
-                    if self.dwta_live_cache is not None
-                    else self.dwta_data.compatibility_matrix
-                ),
+                compatibility_matrix=compat_matrix,
                 mutation_prob=self.config.mutation_prob,
                 rng=self.rng,
                 mutation_step=dwta_mutation_step,
@@ -307,11 +311,7 @@ class NSGA2Solver:
                 child_b,
                 n_weapons=self.dwta_data.n_weapons,
                 n_targets=self.dwta_data.n_targets,
-                compatibility_matrix=(
-                    self.dwta_live_cache.get_snapshot().compatibility_mask.astype(int).tolist()
-                    if self.dwta_live_cache is not None
-                    else self.dwta_data.compatibility_matrix
-                ),
+                compatibility_matrix=compat_matrix,
                 mutation_prob=self.config.mutation_prob,
                 rng=self.rng,
                 mutation_step=dwta_mutation_step,

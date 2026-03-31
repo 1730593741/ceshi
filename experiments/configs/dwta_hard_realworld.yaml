@@ -81,7 +81,7 @@ problem:
       trigger_generation: 64
       event_type: ammo_delta
       payload:
-        changes:
+        deltas:
           w01: -2
           w03: -1
           w05: 2
@@ -93,7 +93,7 @@ problem:
       trigger_generation: 92
       event_type: time_window_update
       payload:
-        updates:
+        time_windows:
           t04: [92.0, 108.0]
           t08: [92.0, 110.0]
           t10: [92.0, 105.0]
@@ -131,10 +131,10 @@ controller:
   # 冷却 3 代，避免连续事件导致参数抖动。
   event_control_cooldown: 3
   forced_control_on_major_event: true
-  min_mutation_prob: 0.02
-  max_mutation_prob: 0.85
-  min_crossover_prob: 0.35
-  max_crossover_prob: 0.98
+  min_mutation_prob: 0.01
+  max_mutation_prob: 0.2
+  min_crossover_prob: 0.7
+  max_crossover_prob: 1.0
   mutation_step: 0.06
   crossover_step: 0.04
   feasible_ratio_low: 0.58

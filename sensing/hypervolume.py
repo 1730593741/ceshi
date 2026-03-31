@@ -71,14 +71,27 @@ def compute_hypervolume(points: Sequence[ObjectivePoint], reference_point: Objec
 
 
 def _filter_nondominated_2d(points: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
-    """筛选 非支配 点 用于 two-目标 minimization."""
+    """筛选 非支配 点 用于 two-目标 minimization.
+
+    修复说明：原实现使用 ``other != point`` 作为自身排除条件，当种群中存在
+    重复点时，两个值相同的点互相都不被视为「其它个体」，导致重复点均进入
+    非支配集。修复后改用索引比较（``j != i``），确保与自身以外的所有点
+    正确比较，重复点只保留第一次出现的副本。
+    """
+    pts = list(points)
     result: list[tuple[float, float]] = []
-    for point in points:
+    for i, point in enumerate(pts):
         dominated = False
-        for other in points:
-            if other != point and other[0] <= point[0] and other[1] <= point[1]:
+        for j, other in enumerate(pts):
+            if j == i:
+                continue
+            # ``other`` strictly dominates ``point`` for minimization:
+            # other is no worse on both objectives AND strictly better on at least one.
+            if other[0] <= point[0] and other[1] <= point[1] and (other[0] < point[0] or other[1] < point[1]):
                 dominated = True
                 break
         if not dominated:
-            result.append(point)
+            # Deduplicate: skip if an identical point was already added.
+            if point not in result:
+                result.append(point)
     return result

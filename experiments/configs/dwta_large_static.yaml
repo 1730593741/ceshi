@@ -57,10 +57,10 @@ optimizer:
 controller:
   # 每 5 代控制一次：兼顾响应速度与 LLM 开销。
   control_interval: 5
-  min_mutation_prob: 0.02
-  max_mutation_prob: 0.8
-  min_crossover_prob: 0.4
-  max_crossover_prob: 0.98
+  min_mutation_prob: 0.01
+  max_mutation_prob: 0.2
+  min_crossover_prob: 0.7
+  max_crossover_prob: 1.0
   mutation_step: 0.05
   crossover_step: 0.04
   feasible_ratio_low: 0.65

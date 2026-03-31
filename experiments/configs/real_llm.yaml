@@ -63,11 +63,11 @@ controller:
   reward_alpha: 1.0
   reward_beta: 0.1
   rule:
-    control_interval: 3
-    min_mutation_prob: 0.03
-    max_mutation_prob: 0.75
-    min_crossover_prob: 0.45
-    max_crossover_prob: 0.98
+    control_interval: 10
+    min_mutation_prob: 0.01
+    max_mutation_prob: 0.2
+    min_crossover_prob: 0.7
+    max_crossover_prob: 1.0
     min_eta_c: 5.0
     max_eta_c: 40.0
     min_eta_m: 5.0

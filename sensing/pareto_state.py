@@ -74,9 +74,10 @@ class ParetoStateSensor:
 
         current_feasible_ratio = feasible_ratio(violations)
         current_mean_cv = mean_constraint_violation(violations)
-        current_rank1_ratio = _compute_rank1_ratio(population)
-        current_diversity = _compute_diversity_score(objectives)
+        # Single non-dominated scan: reuse rank1 list for ratio + downstream metrics.
         rank1_individuals = _rank1_individuals(population)
+        current_rank1_ratio = len(rank1_individuals) / len(population) if population else 0.0
+        current_diversity = _compute_diversity_score(objectives)
         current_crowding_entropy = _compute_crowding_entropy(rank1_individuals)
         current_d_dec = _compute_decision_diversity(population)
         current_d_front = _compute_front_separation(population, rank1_individuals)
@@ -245,7 +246,9 @@ def _compute_front_separation(
     if not rank1_individuals:
         return 0.0
 
-    dominated = [ind for ind in population if not _is_nondominated(ind, population)]
+    # Derive dominated set from pre-computed rank1 to avoid a third O(n²) scan.
+    rank1_ids = {id(ind) for ind in rank1_individuals}
+    dominated = [ind for ind in population if id(ind) not in rank1_ids]
     if not dominated:
         return 1.0
 

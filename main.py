@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from controller.closed_loop import (
     ClosedLoopRunner,
+    HybridController,
     LLMChainController,
     RewardConfig,
     RuleBasedController,
@@ -292,7 +293,7 @@ class MemoryConfig(BaseModel):
 class ControllerModeConfig(BaseModel):
     """Controller 模式 switch 与 模式-specific options."""
 
-    mode: Literal["rule", "mock_llm", "real_llm"] = "rule"
+    mode: Literal["rule", "mock_llm", "real_llm", "hybrid_llm"] = "rule"
     experience_lookback: int = 5
 
 
@@ -352,26 +353,26 @@ class ControllerConfig(BaseModel):
     """实验导向控制配置：统一 rule/llm/memory 参数."""
 
     rule: RuleControllerConfig = Field(default_factory=RuleControllerConfig)
-    mode: Literal["rule", "mock_llm", "real_llm"] = "rule"
+    mode: Literal["rule", "mock_llm", "real_llm", "hybrid_llm"] = "rule"
     experience_lookback: int = 5
     memory_enabled: bool = True
     memory_window: int = 100
     experience_log_path: str | None = None
     reward_alpha: float = 1.0
     reward_beta: float = 0.1
+    # Hybrid-specific: stagnation threshold to wake up LLM controller
+    hybrid_stagnation_llm_threshold: int = 5
 
-    def __getattr__(self, name: str) -> Any:
-        rule_fields = RuleControllerConfig.__dataclass_fields__
-        if name in rule_fields:
-            return getattr(self.rule, name)
-        raise AttributeError(name)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        rule_fields = RuleControllerConfig.__dataclass_fields__
-        if name in rule_fields and "rule" in self.__dict__:
-            setattr(self.rule, name, value)
-            return
-        super().__setattr__(name, value)
+    # NOTE: __getattr__ / __setattr__ overrides are intentionally omitted.
+    # In Pydantic v2, overriding these magic methods on a BaseModel subclass
+    # is unsafe: __getattr__ is called during model initialisation (before
+    # fields are populated) and can cause infinite recursion or AttributeError
+    # when the delegated field (self.rule) is not yet set.
+    #
+    # Rule-controller fields must be accessed via ``config.controller.rule.<field>``
+    # directly. The RuleControllerConfig dataclass is always fully constructed
+    # before ControllerConfig validation completes, so direct attribute access
+    # on ``self.rule`` is always safe after model_validate() returns.
 
 
 class ExperimentConfig(BaseModel):
@@ -581,55 +582,70 @@ def build_solver(problem: ProblemConfig, optimizer: NSGA2Config) -> NSGA2Solver:
     )
 
 
-def build_controller(config: ExperimentConfig) -> RuleBasedController | LLMChainController:
-    """按模式构建规则或 LLM 控制器，而不改变 运行器 API."""
+def build_controller(config: ExperimentConfig) -> RuleBasedController | LLMChainController | HybridController:
+    """按模式构建规则、LLM 或混合控制器，而不改变运行器 API."""
     mode = config.controller.mode
     rule = config.controller.rule
     if mode == "rule":
         return RuleBasedController(rule)
 
-    llm_client = LLMClient(
-        LLMClientConfig(
-            mode=mode,
-            provider=config.llm.provider,
-            model=config.llm.model,
-            timeout_s=config.llm.timeout_s,
-            min_read_timeout_s=getattr(config.llm, "min_read_timeout_s", config.llm.timeout_s),
-            max_retries=config.llm.max_retries,
-            api_key_env=config.llm.api_key_env,
-            base_url_env=config.llm.base_url_env,
-            model_env=config.llm.model_env,
-            base_url=config.llm.base_url,
-            fallback_mode=config.llm.fallback_mode,
+    def _build_llm_chain(llm_mode: str = "real_llm") -> LLMChainController:
+        """内部辅助：构建 LLMChainController 实例."""
+        llm_client = LLMClient(
+            LLMClientConfig(
+                mode=llm_mode,
+                provider=config.llm.provider,
+                model=config.llm.model,
+                timeout_s=config.llm.timeout_s,
+                min_read_timeout_s=getattr(config.llm, "min_read_timeout_s", config.llm.timeout_s),
+                max_retries=config.llm.max_retries,
+                api_key_env=config.llm.api_key_env,
+                base_url_env=config.llm.base_url_env,
+                model_env=config.llm.model_env,
+                base_url=config.llm.base_url,
+                fallback_mode=config.llm.fallback_mode,
+            )
         )
-    )
-    analyst = Analyst(llm_client)
-    strategist = Strategist(llm_client)
-    actuator = Actuator(
-        llm_client,
-        min_mutation_prob=rule.min_mutation_prob,
-        max_mutation_prob=rule.max_mutation_prob,
-        min_crossover_prob=rule.min_crossover_prob,
-        max_crossover_prob=rule.max_crossover_prob,
-        min_eta_c=rule.min_eta_c,
-        max_eta_c=rule.max_eta_c,
-        min_eta_m=rule.min_eta_m,
-        max_eta_m=rule.max_eta_m,
-        min_repair_prob=rule.min_repair_prob,
-        max_repair_prob=rule.max_repair_prob,
-        min_local_search_prob=rule.min_local_search_prob,
-        max_local_search_prob=rule.max_local_search_prob,
-    )
-    return LLMChainController(
-        control_interval=rule.control_interval,
-        experience_lookback=config.controller.experience_lookback,
-        event_triggered_control=rule.event_triggered_control,
-        event_control_cooldown=rule.event_control_cooldown,
-        forced_control_on_major_event=rule.forced_control_on_major_event,
-        analyst=analyst,
-        strategist=strategist,
-        actuator=actuator,
-    )
+        analyst = Analyst(llm_client)
+        actuator = Actuator(
+            llm_client,
+            min_mutation_prob=rule.min_mutation_prob,
+            max_mutation_prob=rule.max_mutation_prob,
+            min_crossover_prob=rule.min_crossover_prob,
+            max_crossover_prob=rule.max_crossover_prob,
+            min_eta_c=rule.min_eta_c,
+            max_eta_c=rule.max_eta_c,
+            min_eta_m=rule.min_eta_m,
+            max_eta_m=rule.max_eta_m,
+            min_repair_prob=rule.min_repair_prob,
+            max_repair_prob=rule.max_repair_prob,
+            min_local_search_prob=rule.min_local_search_prob,
+            max_local_search_prob=rule.max_local_search_prob,
+        )
+        return LLMChainController(
+            control_interval=rule.control_interval,
+            experience_lookback=config.controller.experience_lookback,
+            event_triggered_control=rule.event_triggered_control,
+            event_control_cooldown=rule.event_control_cooldown,
+            forced_control_on_major_event=rule.forced_control_on_major_event,
+            analyst=analyst,
+            actuator=actuator,
+        )
+
+    if mode == "hybrid_llm":
+        rule_ctrl = RuleBasedController(rule)
+        llm_ctrl = _build_llm_chain("real_llm")
+        return HybridController(
+            rule_controller=rule_ctrl,
+            llm_controller=llm_ctrl,
+            control_interval=rule.control_interval,
+            stagnation_llm_threshold=config.controller.hybrid_stagnation_llm_threshold,
+            event_triggered_control=rule.event_triggered_control,
+            event_control_cooldown=rule.event_control_cooldown,
+            forced_control_on_major_event=rule.forced_control_on_major_event,
+        )
+
+    return _build_llm_chain(mode)
 
 
 def resolve_artifacts(config: ExperimentConfig) -> RunArtifacts:
@@ -659,6 +675,7 @@ def resolve_artifacts(config: ExperimentConfig) -> RunArtifacts:
 def build_runtime(config: ExperimentConfig) -> RuntimeBundle:
     """组装 求解器、控制器、运行器 与输出产物."""
     artifacts = resolve_artifacts(config)
+    _reset_run_logs(artifacts)
     solver = build_solver(config.problem, config.solver)
     sensor = ParetoStateSensor()
     controller = build_controller(config)
@@ -764,6 +781,8 @@ def _build_dynamic_summary(
     event_triggered_actions = sum(1 for event in action_events if event.get("trigger_type") == "event")
 
     # Aggregate generation-level proxies for dynamic pressure/consumption.
+    # cumulative_unmet_damage: sum of remaining_survivability (objective 0) across all generations.
+    # cumulative_resource_consumption: weapons lost relative to generation-0 baseline.
     cumulative_unmet_damage = 0.0
     cumulative_resource_consumption = 0.0
     if generation_events:
@@ -773,9 +792,13 @@ def _build_dynamic_summary(
         else:
             baseline = 0.0
         for event in generation_events:
-            active_targets = event.get("active_targets_count")
-            if isinstance(active_targets, (int, float)):
-                cumulative_unmet_damage += float(active_targets)
+            # Use rank1_objectives[0] (remaining_survivability) as the unmet-damage proxy.
+            # Fall back to 0.0 when the field is absent (e.g. generation-0 before any front exists).
+            rank1_objs = event.get("rank1_objectives")
+            if isinstance(rank1_objs, list) and rank1_objs:
+                first_point = rank1_objs[0]
+                if isinstance(first_point, (list, tuple)) and len(first_point) >= 1:
+                    cumulative_unmet_damage += float(first_point[0])
             active_weapons = event.get("active_weapons_count")
             if isinstance(active_weapons, (int, float)):
                 cumulative_resource_consumption += max(0.0, baseline - float(active_weapons))
@@ -858,110 +881,114 @@ def run_experiment(config_path: str = "experiments/configs/default.yaml") -> dic
     """运行一次实验并持久化快照与摘要输出."""
     config = load_config(config_path)
     runtime = build_runtime(config)
-    _reset_run_logs(runtime.artifacts)
-    config_fingerprint, run_id = _config_identity(config, config_path)
-    _write_config_snapshot(
-        runtime.artifacts.config_snapshot_path,
-        config,
-        config_path,
-        config_fingerprint=config_fingerprint,
-        run_id=run_id,
-    )
+    try:
+        config_fingerprint, run_id = _config_identity(config, config_path)
+        _write_config_snapshot(
+            runtime.artifacts.config_snapshot_path,
+            config,
+            config_path,
+            config_fingerprint=config_fingerprint,
+            run_id=run_id,
+        )
 
-    start_ts = time.perf_counter()
-    states = runtime.runner.run(generations=config.solver.generations)
-    runtime_s = time.perf_counter() - start_ts
-    split_event_stream(
-        events_path=runtime.artifacts.events_path,
-        state_log_path=runtime.artifacts.generation_log_path,
-        action_log_path=runtime.artifacts.action_log_path,
-    )
+        start_ts = time.perf_counter()
+        states = runtime.runner.run(generations=config.solver.generations)
+        runtime_s = time.perf_counter() - start_ts
+        split_event_stream(
+            events_path=runtime.artifacts.events_path,
+            state_log_path=runtime.artifacts.generation_log_path,
+            action_log_path=runtime.artifacts.action_log_path,
+        )
 
-    final = states[-1]
-    best_state = max(states, key=lambda state: state.hv)
-    hv_auc = sum(state.hv for state in states) / len(states) if states else 0.0
+        final = states[-1]
+        best_state = max(states, key=lambda state: state.hv)
+        hv_auc = sum(state.hv for state in states) / len(states) if states else 0.0
 
-    generation_events = _read_jsonl(runtime.artifacts.generation_log_path)
-    action_events = _read_jsonl(runtime.artifacts.action_log_path)
-    runtime_events = [
-        event for event in _read_jsonl(runtime.artifacts.events_path) if event.get("event") == "runtime_event"
-    ]
-    final_generation_event = generation_events[-1] if generation_events else {}
-    num_experiences = 0
-    if runtime.artifacts.experiences_path and runtime.artifacts.experiences_path.exists():
-        num_experiences = len(_read_jsonl(runtime.artifacts.experiences_path))
+        generation_events = _read_jsonl(runtime.artifacts.generation_log_path)
+        action_events = _read_jsonl(runtime.artifacts.action_log_path)
+        runtime_events = [
+            event for event in _read_jsonl(runtime.artifacts.events_path) if event.get("event") == "runtime_event"
+        ]
+        final_generation_event = generation_events[-1] if generation_events else {}
+        num_experiences = 0
+        if runtime.artifacts.experiences_path and runtime.artifacts.experiences_path.exists():
+            num_experiences = len(_read_jsonl(runtime.artifacts.experiences_path))
 
-    reference_front = _resolve_reference_front(config, generation_events)
-    final_front_raw = final_generation_event.get("rank1_objectives", final.rank1_objectives)
-    final_front = [tuple(float(v) for v in point) for point in final_front_raw] if isinstance(final_front_raw, list) else []
+        reference_front = _resolve_reference_front(config, generation_events)
+        final_front_raw = final_generation_event.get("rank1_objectives", final.rank1_objectives)
+        final_front = [tuple(float(v) for v in point) for point in final_front_raw] if isinstance(final_front_raw, list) else []
 
-    final_igd = igd(final_front, reference_front.points)
-    final_igd_plus = igd_plus(final_front, reference_front.points)
-    final_spacing = spacing(final_front)
-    final_spread = spread(final_front, reference_front.points) if final_front and reference_front.points else 0.0
+        final_igd = igd(final_front, reference_front.points)
+        final_igd_plus = igd_plus(final_front, reference_front.points)
+        final_spacing = spacing(final_front)
+        final_spread = spread(final_front, reference_front.points) if final_front and reference_front.points else 0.0
 
-    llm_overhead_s = sum(float(event.get("decision_runtime_s", 0.0)) for event in action_events)
-    dynamic_summary = _build_dynamic_summary(
-        config=config,
-        generation_events=generation_events,
-        action_events=action_events,
-        runtime_events=runtime_events,
-    )
+        llm_overhead_s = sum(float(event.get("decision_runtime_s", 0.0)) for event in action_events)
+        dynamic_summary = _build_dynamic_summary(
+            config=config,
+            generation_events=generation_events,
+            action_events=action_events,
+            runtime_events=runtime_events,
+        )
 
-    summary = {
-        "experiment": config.experiment.model_dump(mode="json"),
-        "controller_mode": config.controller.mode,
-        "method": config.experiment.method or config.experiment.name,
-        "benchmark": config.experiment.benchmark or "unknown",
-        "seed": config.experiment.seed if config.experiment.seed is not None else config.solver.seed,
-        "source_config_path": str(config_path),
-        "run_id": run_id,
-        "config_fingerprint": config_fingerprint,
-        "generations": config.solver.generations,
-        "final_generation": final.generation,
-        "final_hv": final.hv,
-        "best_hv": best_state.hv,
-        "best_generation": best_state.generation,
-        "hv_auc": hv_auc,
-        "mean_hv": hv_auc,
-        "final_feasible_ratio": final.feasible_ratio,
-        "final_rank1_ratio": final.rank1_ratio,
-        "final_igd": final_igd,
-        "final_igd_plus": final_igd_plus,
-        "final_spacing": final_spacing,
-        "final_spread": final_spread,
-        "reference_front": {
-            "source": reference_front.source,
-            "details": reference_front.details,
-            "num_points": len(reference_front.points),
-        },
-        "final_mutation_prob": final_generation_event.get("mutation_prob", runtime.solver.config.mutation_prob),
-        "final_crossover_prob": final_generation_event.get("crossover_prob", runtime.solver.config.crossover_prob),
-        "final_operator_params": (
-            final_generation_event.get("operator_params")
-            or runtime.solver.get_operator_params().to_dict()
-        ),
-        "final_effective_params": (
-            OperatorParams(**(final_generation_event.get("operator_params") or runtime.solver.get_operator_params().to_dict()))
-            .active_params(runtime.solver.get_operator_capabilities())
-        ),
-        "operator_capabilities": runtime.solver.get_operator_capabilities().to_dict(),
-        "events_path": str(runtime.artifacts.events_path),
-        "experiences_path": str(runtime.artifacts.experiences_path) if runtime.artifacts.experiences_path else None,
-        "num_actions": len(action_events),
-        "runtime_s": runtime_s,
-        "llm_overhead_s": llm_overhead_s,
-        "control_state_counts": _count_control_states(action_events),
-        "num_experiences": num_experiences,
-        # Dynamic metrics are nested to keep legacy top-level summary schema stable.
-        "dynamic_summary": dynamic_summary,
-        "config_snapshot_path": str(runtime.artifacts.config_snapshot_path),
-        "generation_log_path": str(runtime.artifacts.generation_log_path),
-        "action_log_path": str(runtime.artifacts.action_log_path),
-    }
-    _write_summary(runtime.artifacts.summary_path, summary)
-    summary["summary_path"] = str(runtime.artifacts.summary_path)
-    return summary
+        summary = {
+            "experiment": config.experiment.model_dump(mode="json"),
+            "controller_mode": config.controller.mode,
+            "method": config.experiment.method or config.experiment.name,
+            "benchmark": config.experiment.benchmark or "unknown",
+            "seed": config.experiment.seed if config.experiment.seed is not None else config.solver.seed,
+            "source_config_path": str(config_path),
+            "run_id": run_id,
+            "config_fingerprint": config_fingerprint,
+            "generations": config.solver.generations,
+            "final_generation": final.generation,
+            "final_hv": final.hv,
+            "best_hv": best_state.hv,
+            "best_generation": best_state.generation,
+            "hv_auc": hv_auc,
+            "mean_hv": hv_auc,
+            "final_feasible_ratio": final.feasible_ratio,
+            "final_rank1_ratio": final.rank1_ratio,
+            "final_igd": final_igd,
+            "final_igd_plus": final_igd_plus,
+            "final_spacing": final_spacing,
+            "final_spread": final_spread,
+            "reference_front": {
+                "source": reference_front.source,
+                "details": reference_front.details,
+                "num_points": len(reference_front.points),
+            },
+            "final_mutation_prob": final_generation_event.get("mutation_prob", runtime.solver.config.mutation_prob),
+            "final_crossover_prob": final_generation_event.get("crossover_prob", runtime.solver.config.crossover_prob),
+            "final_operator_params": (
+                final_generation_event.get("operator_params")
+                or runtime.solver.get_operator_params().to_dict()
+            ),
+            "final_effective_params": (
+                OperatorParams(**(final_generation_event.get("operator_params") or runtime.solver.get_operator_params().to_dict()))
+                .active_params(runtime.solver.get_operator_capabilities())
+            ),
+            "operator_capabilities": runtime.solver.get_operator_capabilities().to_dict(),
+            "events_path": str(runtime.artifacts.events_path),
+            "experiences_path": str(runtime.artifacts.experiences_path) if runtime.artifacts.experiences_path else None,
+            "num_actions": len(action_events),
+            "runtime_s": runtime_s,
+            "llm_overhead_s": llm_overhead_s,
+            "control_state_counts": _count_control_states(action_events),
+            "num_experiences": num_experiences,
+            # Dynamic metrics are nested to keep legacy top-level summary schema stable.
+            "dynamic_summary": dynamic_summary,
+            "config_snapshot_path": str(runtime.artifacts.config_snapshot_path),
+            "generation_log_path": str(runtime.artifacts.generation_log_path),
+            "action_log_path": str(runtime.artifacts.action_log_path),
+        }
+        _write_summary(runtime.artifacts.summary_path, summary)
+        summary["summary_path"] = str(runtime.artifacts.summary_path)
+        return summary
+    finally:
+        runtime.runner.logger.close()
+        if runtime.runner.experience_logger:
+            runtime.runner.experience_logger.close()
 
 
 def main(config_path: str = "experiments/configs/default.yaml") -> None:
