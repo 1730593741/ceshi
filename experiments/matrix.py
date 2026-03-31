@@ -110,8 +110,8 @@ ABLATION_PRESETS: dict[str, AblationMatrix] = {
         benchmarks=("dwta_hard_realworld",),
         generations=160,
         population_size=128,
-        tau_values=(5,),
-        memory_windows=(20,),
+        tau_values=(3, 5, 10),
+        memory_windows=(5, 20, 40),
     ),
     "toy": AblationMatrix(
         seeds=(7,),
