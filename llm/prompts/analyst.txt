@@ -23,13 +23,6 @@ DWTA guidance:
 - A low feasible_ratio often indicates ammo over-allocation and/or violations of spatial-temporal/range compatibility.
 - Keep analysis aligned with the existing four-state control semantics.
 
-Experience utilization rules:
-- If recent_experiences is non-empty, compute the average reward trend.
-- If the last 3+ rewards are negative, the current strategy direction is failing — switch control_state.
-- If rewards show sustained positive growth, the current approach is effective — consider maintain_balance.
-- If rewards oscillate around zero, minor corrections are needed but no drastic change.
-- A single-generation stagnation (stagnation_len < 3) is normal; only trigger convergence push when stagnation_len >= 3.
-
 Return ONLY valid JSON with keys:
 - control_state: string (one of the four values)
 - reason: string (concise tag explaining why this control_state was chosen, e.g. "low_feasibility", "stagnation_detected")

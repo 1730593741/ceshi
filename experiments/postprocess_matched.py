@@ -11,7 +11,12 @@ from typing import Any
 import numpy as np
 
 from eval.metrics import igd, igd_plus, spacing, spread
-from eval.reference_front import build_empirical_reference_front, read_final_front_from_generation_log
+from eval.reference_front import (
+    build_empirical_reference_front,
+    read_final_front_from_generation_log,
+    read_generation_fronts_from_generation_log,
+)
+from sensing.hypervolume import compute_hypervolume
 
 _METHODS = ("baseline_nsga2", "rule_control", "mock_llm", "real_llm", "hybrid_llm")
 
@@ -41,30 +46,68 @@ def _aggregate(values: list[float]) -> dict[str, float | int]:
     return {"mean": float(np.mean(arr)), "std": std, "n": int(arr.size)}
 
 
-def summarize_matched_runs(runs_root: Path) -> dict[str, Any]:
+def _build_hypervolume_reference_point(points: list[tuple[float, ...]]) -> tuple[float, ...]:
+    """Construct one shared HV reference point for all matched runs of a benchmark."""
+    if not points:
+        return (1.0, 1.0)
+    matrix = np.asarray(points, dtype=float)
+    maxima = matrix.max(axis=0)
+    padding = np.maximum(np.abs(maxima) * 0.1, 1e-6)
+    return tuple((maxima + padding).tolist())
+
+
+def collect_matched_run_rows(runs_root: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Collect per-run rows with matched comparable metrics recomputed post hoc."""
     runs_by_method = _collect_run_summaries(runs_root)
     method_to_logs: dict[str, list[Path]] = {}
     for method, summaries in runs_by_method.items():
         method_to_logs[method] = [Path(s["generation_log_path"]) for s in summaries if s.get("generation_log_path")]
 
     reference = build_empirical_reference_front(method_to_logs)
+    hv_reference_point = _build_hypervolume_reference_point(reference.points)
+    reference_payload = {
+        "source": reference.source,
+        "is_comparable": True,
+        "details": {
+            **reference.details,
+            "hv_reference_point": list(hv_reference_point),
+        },
+        "num_points": len(reference.points),
+    }
 
-    per_method_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    rows: list[dict[str, Any]] = []
     for method, summaries in runs_by_method.items():
         for summary in summaries:
             generation_log_path = Path(summary["generation_log_path"])
-            final_front = read_final_front_from_generation_log(generation_log_path)
+            generation_fronts = read_generation_fronts_from_generation_log(generation_log_path)
+            final_front = generation_fronts[-1] if generation_fronts else read_final_front_from_generation_log(generation_log_path)
+            hv_values = [compute_hypervolume(front, hv_reference_point) for front in generation_fronts]
+
             row = dict(summary)
+            row["method"] = summary.get("method", method)
+            row["benchmark"] = summary.get("benchmark", runs_root.name)
+            row["summary_path"] = str(generation_log_path.parent / "summary.json")
+            if hv_values:
+                comparable_mean_hv = float(np.mean(np.asarray(hv_values, dtype=float)))
+                row["final_hv"] = float(hv_values[-1])
+                row["best_hv"] = float(max(hv_values))
+                row["hv_auc"] = comparable_mean_hv
+                row["mean_hv"] = comparable_mean_hv
             row["final_igd"] = igd(final_front, reference.points)
             row["final_igd_plus"] = igd_plus(final_front, reference.points)
             row["final_spacing"] = spacing(final_front)
             row["final_spread"] = spread(final_front, reference.points) if final_front and reference.points else 0.0
-            row["reference_front"] = {
-                "source": reference.source,
-                "details": reference.details,
-                "num_points": len(reference.points),
-            }
-            per_method_rows[method].append(row)
+            row["reference_front"] = reference_payload
+            rows.append(row)
+
+    return rows, reference_payload
+
+
+def summarize_matched_runs(runs_root: Path) -> dict[str, Any]:
+    rows, reference_payload = collect_matched_run_rows(runs_root)
+    per_method_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        per_method_rows[str(row["method"])].append(row)
 
     metrics = [
         "final_hv",
@@ -88,11 +131,7 @@ def summarize_matched_runs(runs_root: Path) -> dict[str, Any]:
     return {
         "runs_root": str(runs_root),
         "methods": list(_METHODS),
-        "reference_front": {
-            "source": reference.source,
-            "details": reference.details,
-            "num_points": len(reference.points),
-        },
+        "reference_front": reference_payload,
         "grouped": grouped,
         "num_runs": {m: len(per_method_rows[m]) for m in _METHODS},
     }

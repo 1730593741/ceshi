@@ -55,21 +55,27 @@ def read_final_front_from_generation_log(path: Path) -> list[ObjectivePoint]:
         This 为 explicit 与 可复现的 because 点 为 recorded 在 该 运行 日志,
         then declared 作为 sourced 从 该 exact file path.
         """
+    fronts = read_generation_fronts_from_generation_log(path)
+    return fronts[-1] if fronts else []
+
+
+def read_generation_fronts_from_generation_log(path: Path) -> list[list[ObjectivePoint]]:
+    """从 generation_metrics JSONL 读取每一代的 rank-1 前沿目标值."""
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8") as f:
         rows = [json.loads(line) for line in f if line.strip()]
-    if not rows:
-        return []
-    final = rows[-1]
-    raw_front = final.get("rank1_objectives")
-    if not isinstance(raw_front, list):
-        return []
-    parsed: list[ObjectivePoint] = []
-    for point in raw_front:
-        if isinstance(point, (list, tuple)):
-            parsed.append(tuple(float(v) for v in point))
-    return nondominated(parsed)
+    fronts: list[list[ObjectivePoint]] = []
+    for row in rows:
+        raw_front = row.get("rank1_objectives")
+        if not isinstance(raw_front, list):
+            continue
+        parsed: list[ObjectivePoint] = []
+        for point in raw_front:
+            if isinstance(point, (list, tuple)):
+                parsed.append(tuple(float(v) for v in point))
+        fronts.append(nondominated(parsed))
+    return fronts
 
 
 def build_empirical_reference_front(method_to_generation_logs: dict[str, list[Path]]) -> ReferenceFront:

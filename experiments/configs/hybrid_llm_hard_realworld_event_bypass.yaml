@@ -1,0 +1,183 @@
+experiment:
+  name: hybrid_llm_hard_realworld_event_bypass
+  seed: 2026
+  method: hybrid_llm
+  benchmark: dwta_hard_realworld
+
+problem:
+  problem_type: dwta
+  scenario_mode: scripted_waves
+  max_weapons: 16
+  max_targets: 32
+
+  munition_types:
+    - id: m_he
+      max_range: 14.0
+      flight_speed: 3.2
+      lethality: 2.3
+    - id: m_ap
+      max_range: 18.0
+      flight_speed: 4.0
+      lethality: 2.8
+    - id: m_lr
+      max_range: 26.0
+      flight_speed: 5.0
+      lethality: 1.9
+
+  weapons:
+    - {id: w01, x: 0.0, y: 0.0, munition_type_id: m_he, ammo_capacity: 6}
+    - {id: w02, x: 2.0, y: 0.0, munition_type_id: m_he, ammo_capacity: 5}
+    - {id: w03, x: 4.0, y: 0.0, munition_type_id: m_ap, ammo_capacity: 5}
+    - {id: w04, x: 6.0, y: 0.0, munition_type_id: m_ap, ammo_capacity: 4}
+    - {id: w05, x: 8.0, y: 0.0, munition_type_id: m_lr, ammo_capacity: 4}
+    - {id: w06, x: 10.0, y: 0.0, munition_type_id: m_lr, ammo_capacity: 4}
+    - {id: w07, x: 1.0, y: 2.0, munition_type_id: m_he, ammo_capacity: 5}
+    - {id: w08, x: 3.0, y: 2.0, munition_type_id: m_ap, ammo_capacity: 5}
+
+  targets:
+    - {id: t01, x: 5.0, y: 6.0, required_damage: 3.2, time_window: [0.0, 18.0]}
+    - {id: t02, x: 8.0, y: 5.0, required_damage: 3.6, time_window: [0.0, 20.0]}
+    - {id: t03, x: 11.0, y: 4.0, required_damage: 4.0, time_window: [0.0, 22.0]}
+    - {id: t04, x: 14.0, y: 6.0, required_damage: 3.9, time_window: [0.0, 24.0]}
+    - {id: t05, x: 16.0, y: 8.0, required_damage: 4.3, time_window: [0.0, 25.0]}
+    - {id: t06, x: 18.0, y: 5.0, required_damage: 3.1, time_window: [0.0, 19.0]}
+    - {id: t07, x: 20.0, y: 7.0, required_damage: 4.1, time_window: [0.0, 24.0]}
+    - {id: t08, x: 22.0, y: 6.0, required_damage: 3.5, time_window: [0.0, 20.0]}
+    - {id: t09, x: 24.0, y: 5.0, required_damage: 4.6, time_window: [0.0, 26.0]}
+    - {id: t10, x: 26.0, y: 8.0, required_damage: 3.8, time_window: [0.0, 21.0]}
+
+  waves:
+    - wave_id: wave_1_disable
+      trigger_generation: 20
+      event_type: disable_weapons
+      payload:
+        weapon_ids: [w02, w07]
+      note: two launchers lost due to EW damage
+
+    - wave_id: wave_2_inject_targets
+      trigger_generation: 38
+      event_type: inject_targets
+      payload:
+        targets:
+          - {id: t11, x: 12.0, y: 10.0, required_damage: 3.7, time_window: [38.0, 60.0]}
+          - {id: t12, x: 18.0, y: 10.0, required_damage: 4.4, time_window: [38.0, 66.0]}
+          - {id: t13, x: 25.0, y: 11.0, required_damage: 4.8, time_window: [38.0, 72.0]}
+      note: follow-up raid targets appear
+
+    - wave_id: wave_2_priority_update
+      trigger_generation: 40
+      event_type: target_priority_update
+      payload:
+        target_ids: [t03, t05, t12]
+        priority_scale: 1.35
+      note: command increases high-value target urgency
+
+    - wave_id: wave_3_ammo_shift
+      trigger_generation: 64
+      event_type: ammo_delta
+      payload:
+        deltas:
+          w01: -2
+          w03: -1
+          w05: 2
+          w08: 1
+      note: partial resupply with asymmetric loss and gain
+
+    - wave_id: wave_4_window_compress
+      trigger_generation: 92
+      event_type: time_window_update
+      payload:
+        time_windows:
+          t04: [92.0, 108.0]
+          t08: [92.0, 110.0]
+          t10: [92.0, 105.0]
+          t13: [92.0, 120.0]
+      note: weather and ROE shrink engagement windows
+
+    - wave_id: wave_5_final_push
+      trigger_generation: 118
+      event_type: inject_targets
+      payload:
+        targets:
+          - {id: t14, x: 9.0, y: 12.0, required_damage: 4.9, time_window: [118.0, 145.0]}
+          - {id: t15, x: 15.0, y: 13.0, required_damage: 5.2, time_window: [118.0, 150.0]}
+      note: final wave creates end-game saturation
+
+solver:
+  population_size: 96
+  generations: 160
+  crossover_prob: 0.9
+  mutation_prob: 0.1
+  repair_prob: 1.0
+  eta_c: null
+  eta_m: null
+  local_search_prob: null
+  seed: 2026
+
+controller:
+  mode: hybrid_llm
+  experience_lookback: 4
+  memory_enabled: true
+  memory_window: 100
+  reward_alpha: 1.0
+  reward_beta: 0.1
+  hybrid_stagnation_llm_threshold: 5
+  rule:
+    control_interval: 5
+    event_triggered_control: true
+    event_control_cooldown: 2
+    forced_control_on_major_event: true
+    min_mutation_prob: 0.01
+    max_mutation_prob: 0.2
+    min_crossover_prob: 0.7
+    max_crossover_prob: 1.0
+    min_eta_c: 5.0
+    max_eta_c: 40.0
+    min_eta_m: 5.0
+    max_eta_m: 80.0
+    min_repair_prob: 0.0
+    max_repair_prob: 1.0
+    min_local_search_prob: 0.0
+    max_local_search_prob: 0.2
+    mutation_step: 0.05
+    crossover_step: 0.04
+    eta_c_step: 2.0
+    eta_m_step: 4.0
+    repair_step: 0.08
+    local_search_step: 0.05
+    feasible_ratio_low: 0.6
+    diversity_low: 0.12
+    improvement_threshold: 0.0001
+    stagnation_threshold: 3
+    recovery_ratio: 0.5
+    default_eta_c: 15.0
+    default_eta_m: 20.0
+    default_local_search_prob: 0.0
+
+ablation:
+  disabled_observations: []
+  disable_history: false
+  disabled_action_dimensions: []
+
+logging:
+  output_dir: experiments/logs/hybrid_llm_hard_realworld_event_bypass
+  events_file: events.jsonl
+  experiences_file: experiences.jsonl
+  summary_file: summary.json
+  config_snapshot_file: config_snapshot.yaml
+  generation_log_file: generation_metrics.jsonl
+  action_log_file: actions.jsonl
+
+evaluation:
+  reference_front_mode: auto
+
+llm:
+  provider: openai
+  model: gpt-4o-mini
+  timeout_s: 8.0
+  max_retries: 2
+  api_key_env: OPENAI_API_KEY
+  base_url_env: OPENAI_BASE_URL
+  model_env: OPENAI_MODEL
+  base_url: https://api.openai.com/v1/chat/completions
+  fallback_mode: mock_llm

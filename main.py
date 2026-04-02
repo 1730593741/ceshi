@@ -693,6 +693,7 @@ def build_runtime(config: ExperimentConfig) -> RuntimeBundle:
         experience_pool=experience_pool,
         experience_logger=experience_logger,
         reward_config=reward_config,
+        stagnation_tolerance=config.controller.rule.improvement_threshold,
     )
     return RuntimeBundle(config=config, solver=solver, runner=runner, artifacts=artifacts)
 
@@ -792,13 +793,17 @@ def _build_dynamic_summary(
         else:
             baseline = 0.0
         for event in generation_events:
-            # Use rank1_objectives[0] (remaining_survivability) as the unmet-damage proxy.
-            # Fall back to 0.0 when the field is absent (e.g. generation-0 before any front exists).
+            # Use the MINIMUM of the first objective (remaining_survivability) as the unmet-damage proxy.
+            # This ensures stability across different Pareto front orderings.
             rank1_objs = event.get("rank1_objectives")
             if isinstance(rank1_objs, list) and rank1_objs:
-                first_point = rank1_objs[0]
-                if isinstance(first_point, (list, tuple)) and len(first_point) >= 1:
-                    cumulative_unmet_damage += float(first_point[0])
+                all_survivability = [
+                    float(point[0])
+                    for point in rank1_objs
+                    if isinstance(point, (list, tuple)) and len(point) >= 1
+                ]
+                if all_survivability:
+                    cumulative_unmet_damage += min(all_survivability)
             active_weapons = event.get("active_weapons_count")
             if isinstance(active_weapons, (int, float)):
                 cumulative_resource_consumption += max(0.0, baseline - float(active_weapons))
@@ -923,7 +928,11 @@ def run_experiment(config_path: str = "experiments/configs/default.yaml") -> dic
         final_spacing = spacing(final_front)
         final_spread = spread(final_front, reference_front.points) if final_front and reference_front.points else 0.0
 
-        llm_overhead_s = sum(float(event.get("decision_runtime_s", 0.0)) for event in action_events)
+        llm_overhead_s = sum(
+            float(event.get("decision_runtime_s", 0.0))
+            for event in action_events
+            if event.get("is_llm_decision")
+        )
         dynamic_summary = _build_dynamic_summary(
             config=config,
             generation_events=generation_events,
@@ -955,6 +964,7 @@ def run_experiment(config_path: str = "experiments/configs/default.yaml") -> dic
             "final_spread": final_spread,
             "reference_front": {
                 "source": reference_front.source,
+                "is_comparable": reference_front.source in {"true_pareto_front", "empirical_matched_runs"},
                 "details": reference_front.details,
                 "num_points": len(reference_front.points),
             },

@@ -11,6 +11,18 @@ from typing import Any
 
 import numpy as np
 
+from experiments.postprocess_matched import collect_matched_run_rows
+
+_MATCHED_METHODS = frozenset(
+    {
+        "baseline_nsga2",
+        "rule_control",
+        "mock_llm",
+        "real_llm",
+        "hybrid_llm",
+    }
+)
+
 EXPORT_FIELDS: tuple[str, ...] = (
     "method",
     "benchmark",
@@ -25,6 +37,8 @@ EXPORT_FIELDS: tuple[str, ...] = (
     "num_events",
     "wave_completion_rate",
     "event_triggered_actions",
+    "reference_front_source",
+    "reference_front_is_comparable",
     "summary_path",
 )
 
@@ -40,6 +54,7 @@ def _iter_summary_paths(runs_root: Path) -> list[Path]:
 
 def _to_row(summary: dict[str, Any], summary_path: Path) -> dict[str, Any]:
     dynamic = summary.get("dynamic_summary", {}) if isinstance(summary.get("dynamic_summary"), dict) else {}
+    reference_front = summary.get("reference_front", {}) if isinstance(summary.get("reference_front"), dict) else {}
     return {
         "method": summary.get("method") or summary.get("controller_mode") or "unknown",
         "benchmark": summary.get("benchmark") or "unknown",
@@ -54,6 +69,8 @@ def _to_row(summary: dict[str, Any], summary_path: Path) -> dict[str, Any]:
         "num_events": int(dynamic.get("num_events", 0)),
         "wave_completion_rate": float(dynamic.get("wave_completion_rate", 0.0)),
         "event_triggered_actions": int(dynamic.get("event_triggered_actions", 0)),
+        "reference_front_source": str(reference_front.get("source", "")),
+        "reference_front_is_comparable": bool(reference_front.get("is_comparable", False)),
         "summary_path": str(summary_path),
     }
 
@@ -65,6 +82,14 @@ def collect_rows(runs_root: str | Path) -> list[dict[str, Any]]:
     for summary_path in _iter_summary_paths(root):
         rows.append(_to_row(_read_json(summary_path), summary_path))
     return rows
+
+def collect_rows_within(runs_root: str | Path, relative_subdir: str | Path) -> list[dict[str, Any]]:
+    """收集 runs_root 下某个子目录内的 summary rows（若目录不存在则返回空列表）。"""
+    root = Path(runs_root)
+    target = root / relative_subdir
+    if not target.exists():
+        return []
+    return collect_rows(target)
 
 
 def _aggregate(values: list[float]) -> dict[str, Any]:
@@ -124,9 +149,13 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], fields: tuple[str, ...]) 
         writer.writerows(rows)
 
 
-def export_results(*, runs_root: str | Path, output_dir: str | Path) -> dict[str, str]:
-    """Export 扁平 与 aggregated results 到 csv/json + paper-table input csv files."""
-    rows = collect_rows(runs_root)
+def _write_exports(
+    *,
+    rows: list[dict[str, Any]],
+    output_dir: str | Path,
+    extra_payload: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """Persist flat rows, grouped aggregates, and paper-table CSVs."""
     aggregates = build_aggregates(rows)
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -137,7 +166,10 @@ def export_results(*, runs_root: str | Path, output_dir: str | Path) -> dict[str
     by_method_benchmark_csv = out / "paper_table_method_benchmark.csv"
 
     _write_csv(raw_csv, rows, EXPORT_FIELDS)
-    raw_json.write_text(json.dumps({"rows": rows, "aggregates": aggregates}, ensure_ascii=False, indent=2), encoding="utf-8")
+    raw_payload = {"rows": rows, "aggregates": aggregates}
+    if extra_payload:
+        raw_payload.update(extra_payload)
+    raw_json.write_text(json.dumps(raw_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     method_rows: list[dict[str, Any]] = []
     for method, metrics in aggregates["method"].items():
@@ -215,13 +247,137 @@ def export_results(*, runs_root: str | Path, output_dir: str | Path) -> dict[str
     }
 
 
+def export_results(*, runs_root: str | Path, output_dir: str | Path) -> dict[str, str]:
+    """Export 扁平 与 aggregated results 到 csv/json + paper-table input csv files."""
+    root = Path(runs_root)
+    if _looks_like_matched_benchmark_root(root):
+        matched_rows, reference_front = collect_matched_run_rows(root)
+        rows = [
+            _to_row(row, Path(str(row.get("summary_path", root / "summary.json"))))
+            for row in matched_rows
+        ]
+        return _write_exports(
+            rows=rows,
+            output_dir=output_dir,
+            extra_payload={
+                "export_mode": "matched_postprocessed_single_benchmark",
+                "reference_fronts": {root.name: reference_front},
+            },
+        )
+
+    rows = collect_rows(root)
+    return _write_exports(rows=rows, output_dir=output_dir)
+
+
+def _iter_benchmark_roots(runs_root: Path) -> list[Path]:
+    """Return benchmark directories that directly contain ``seed_*`` sub-directories."""
+    benchmark_roots: list[Path] = []
+    for child in sorted(runs_root.iterdir()) if runs_root.exists() else []:
+        if not child.is_dir():
+            continue
+        if any(grandchild.is_dir() and grandchild.name.startswith("seed_") for grandchild in child.iterdir()):
+            benchmark_roots.append(child)
+    return benchmark_roots
+
+
+def _looks_like_matched_benchmark_root(runs_root: Path) -> bool:
+    """Detect a single matched benchmark directory shaped like ``seed_*/<method>/summary.json``."""
+    if not runs_root.exists() or not runs_root.is_dir():
+        return False
+
+    seed_dirs = [
+        child
+        for child in sorted(runs_root.iterdir())
+        if child.is_dir() and child.name.startswith("seed_")
+    ]
+    if not seed_dirs:
+        return False
+
+    method_dirs: set[str] = set()
+    has_summary = False
+    for seed_dir in seed_dirs:
+        for method_dir in seed_dir.iterdir():
+            if not method_dir.is_dir():
+                continue
+            method_dirs.add(method_dir.name)
+            has_summary = has_summary or (method_dir / "summary.json").exists()
+
+    return has_summary and bool(method_dirs) and method_dirs.issubset(_MATCHED_METHODS)
+
+
+def export_matched_results(*, runs_root: str | Path, output_dir: str | Path) -> dict[str, str]:
+    """Export matched runs with benchmark-wise comparable metrics recomputed post hoc."""
+    root = Path(runs_root)
+    rows: list[dict[str, Any]] = []
+    reference_fronts: dict[str, Any] = {}
+
+    for benchmark_root in _iter_benchmark_roots(root):
+        benchmark_rows, reference_front = collect_matched_run_rows(benchmark_root)
+        reference_fronts[benchmark_root.name] = reference_front
+        for row in benchmark_rows:
+            summary_path = Path(str(row.get("summary_path", benchmark_root / "summary.json")))
+            rows.append(_to_row(row, summary_path))
+
+    return _write_exports(
+        rows=rows,
+        output_dir=output_dir,
+        extra_payload={
+            "export_mode": "matched_postprocessed",
+            "reference_fronts": reference_fronts,
+        },
+    )
+
+
+def export_split_results(*, matrix_root: str | Path, output_dir: str | Path) -> dict[str, Any]:
+    """
+    按 matrix 目录结构分别导出 matched（对比）与 ablations（消融）汇总结果。
+
+    目录约定：
+    - {matrix_root}/matched
+    - {matrix_root}/ablations
+    """
+    root = Path(matrix_root)
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    outputs: dict[str, Any] = {
+        "matrix_root": str(root),
+        "matched": None,
+        "ablations": None,
+    }
+
+    matched_rows = collect_rows_within(root, "matched")
+    if matched_rows:
+        matched_dir = out / "matched"
+        outputs["matched"] = export_matched_results(runs_root=root / "matched", output_dir=matched_dir)
+
+    ablation_rows = collect_rows_within(root, "ablations")
+    if ablation_rows:
+        ablation_dir = out / "ablations"
+        outputs["ablations"] = export_results(runs_root=root / "ablations", output_dir=ablation_dir)
+
+    outputs["has_data"] = bool(matched_rows or ablation_rows)
+    return outputs
+
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export experiment runs into aggregate tables")
-    parser.add_argument("--runs-root", required=True)
+    parser.add_argument("--runs-root", help="Path to experiment runs root that directly contains summary.json descendants")
+    parser.add_argument(
+        "--matrix-root",
+        help="Path to matrix output root that contains matched/ and ablations/ sub-directories",
+    )
     parser.add_argument("--output-dir", default="experiments/exports")
     args = parser.parse_args()
 
-    outputs = export_results(runs_root=args.runs_root, output_dir=args.output_dir)
+    if bool(args.runs_root) == bool(args.matrix_root):
+        raise SystemExit("Exactly one of --runs-root or --matrix-root must be provided.")
+
+    if args.matrix_root:
+        outputs = export_split_results(matrix_root=args.matrix_root, output_dir=args.output_dir)
+    else:
+        outputs = export_results(runs_root=args.runs_root, output_dir=args.output_dir)
     print(json.dumps(outputs, ensure_ascii=False, indent=2))
 
 

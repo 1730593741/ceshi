@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,12 @@ def _resolve_methods(methods: list[str] | tuple[str, ...] | None) -> tuple[str, 
     if unsupported:
         raise ValueError(f"Unsupported matched methods: {unsupported}")
     return selected
+
+
+def _resolve_max_workers(max_workers: int, num_jobs: int) -> int:
+    if max_workers <= 0:
+        raise ValueError("max_workers must be >= 1")
+    return min(max_workers, max(1, num_jobs))
 
 
 def _build_matched_payload(
@@ -121,6 +128,21 @@ def run_matched_experiments(
     return results
 
 
+def _run_matched_seed_job(job: tuple[str, int, int, int, str, tuple[str, ...]]) -> tuple[int, dict[str, dict[str, Any]]]:
+    output_root, seed, generations, population_size, benchmark, methods = job
+    return (
+        seed,
+        run_matched_experiments(
+            output_root=Path(output_root) / f"seed_{seed}",
+            seed=seed,
+            generations=generations,
+            population_size=population_size,
+            benchmark=benchmark,
+            methods=methods,
+        ),
+    )
+
+
 def run_matched_seed_sweep(
     *,
     output_root: str | Path,
@@ -129,19 +151,34 @@ def run_matched_seed_sweep(
     population_size: int = 24,
     benchmark: str = "dwta_small",
     methods: list[str] | tuple[str, ...] | None = None,
+    max_workers: int = 1,
 ) -> dict[int, dict[str, dict[str, Any]]]:
     """运行 matched comparisons 用于 multiple seeds 在 一个 基准问题."""
     root = Path(output_root)
+    selected_methods = _resolve_methods(methods)
+    seed_list = [int(seed) for seed in seeds]
     results: dict[int, dict[str, dict[str, Any]]] = {}
-    for seed in seeds:
-        results[seed] = run_matched_experiments(
-            output_root=root / f"seed_{seed}",
-            seed=seed,
-            generations=generations,
-            population_size=population_size,
-            benchmark=benchmark,
-            methods=methods,
-        )
+
+    if len(seed_list) <= 1 or max_workers == 1:
+        for seed in seed_list:
+            results[seed] = run_matched_experiments(
+                output_root=root / f"seed_{seed}",
+                seed=seed,
+                generations=generations,
+                population_size=population_size,
+                benchmark=benchmark,
+                methods=selected_methods,
+            )
+        return results
+
+    worker_count = _resolve_max_workers(max_workers, len(seed_list))
+    jobs = [
+        (str(root), seed, generations, population_size, benchmark, selected_methods)
+        for seed in seed_list
+    ]
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        for seed, seed_result in executor.map(_run_matched_seed_job, jobs):
+            results[seed] = seed_result
     return results
 
 
@@ -153,6 +190,7 @@ def run_matched_matrix(
     generations: int,
     population_size: int,
     methods: list[str] | tuple[str, ...] | None = None,
+    max_workers: int = 1,
 ) -> dict[str, dict[int, dict[str, dict[str, Any]]]]:
     """运行 full matched 矩阵 跨 基准问题 x 种子 x 方法."""
     root = Path(output_root)
@@ -166,6 +204,7 @@ def run_matched_matrix(
             population_size=population_size,
             benchmark=benchmark,
             methods=methods,
+            max_workers=max_workers,
         )
     return matrix_results
 

@@ -129,6 +129,7 @@ class ControlAction:
     control_state: ControlState = ControlState.MAINTAIN_BALANCE
     reason_detail: str = ""
     decision_runtime_s: float = 0.0
+    is_llm_decision: bool = False
     trigger_type: str = "periodic"
     trigger_event_id: str | None = None
     cooldown_skipped: bool = False
@@ -429,12 +430,14 @@ class LLMChainController:
             recent_experiences=observation.recent_experiences,
         )
         strategy = StrategyDecision.from_analysis(diagnosis)
-        return self.actuator.act(
+        action = self.actuator.act(
             generation=observation.state.generation,
             strategy=strategy,
             current_params=observation.current_params,
             capabilities=observation.capabilities,
         )
+        action.is_llm_decision = True
+        return action
 
 
 class HybridController:
@@ -497,11 +500,13 @@ class HybridController:
         if use_llm:
             self.llm_wakeup_count += 1
             action = self.llm_controller.decide(observation=observation)
+            action.is_llm_decision = True
             action.reason_detail = f"hybrid_llm_wakeup:{wakeup_reason};{action.reason_detail}"
             return action
 
         self.rule_decision_count += 1
         action = self.rule_controller.decide(observation=observation)
+        action.is_llm_decision = False
         action.reason_detail = f"hybrid_rule;{action.reason_detail}"
         return action
 
@@ -536,6 +541,7 @@ class ClosedLoopRunner:
         experience_pool: ExperiencePool | None = None,
         experience_logger: ExperienceLogger | None = None,
         reward_config: RewardConfig | None = None,
+        stagnation_tolerance: float = 1e-12,
     ) -> None:
         self.solver = solver
         self.sensor = sensor
@@ -545,6 +551,7 @@ class ClosedLoopRunner:
         self.experience_pool = experience_pool
         self.experience_logger = experience_logger
         self.reward_config = reward_config or RewardConfig()
+        self.stagnation_tolerance = stagnation_tolerance
 
     def run(self, *, generations: int, reference_point: tuple[float, ...] | None = None) -> list[ParetoState]:
         """Execute the closed-loop optimization process and return sensed states."""
@@ -574,6 +581,7 @@ class ClosedLoopRunner:
             population=population,
             previous_state=None,
             reference_point=reference_point,
+            stagnation_tolerance=self.stagnation_tolerance,
         )
         states.append(initial_state)
         self._log_state(initial_state, self.solver.get_operator_params())
@@ -593,6 +601,7 @@ class ClosedLoopRunner:
                 population=population,
                 previous_state=previous_state,
                 reference_point=reference_point,
+                stagnation_tolerance=self.stagnation_tolerance,
             )
             states.append(state)
             self._log_state(state, self.solver.get_operator_params(), current_wave_id=current_wave_id)
@@ -750,6 +759,16 @@ class ClosedLoopRunner:
             return None, False, None
 
         cooldown = int(getattr(self.controller, "event_control_cooldown", 0))
+        if (
+            event_due
+            and forced_on_major
+            and last_control_generation is not None
+            and generation - last_control_generation <= cooldown
+        ):
+            # Major events are allowed to bypass cooldown so hybrid controllers
+            # can react immediately to disruptive environment shifts.
+            return "event", False, None
+
         if last_control_generation is not None and generation - last_control_generation <= cooldown:
             # Cooldown active: suppress control but record the would-be trigger.
             suppressed = "event" if event_due else "periodic"

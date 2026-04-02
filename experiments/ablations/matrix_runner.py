@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +75,52 @@ def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _resolve_max_workers(max_workers: int, num_jobs: int) -> int:
+    if max_workers <= 0:
+        raise ValueError("max_workers must be >= 1")
+    return min(max_workers, max(1, num_jobs))
+
+
+def _run_ablation_seed_job(
+    job: tuple[str, dict[str, Any], dict[str, Any], int, int, int, tuple[int, ...], tuple[int, ...], str]
+) -> tuple[int, dict[str, dict[str, Any]]]:
+    (
+        root_str,
+        base_payload,
+        benchmark_problem,
+        seed,
+        generations,
+        population_size,
+        tau_values,
+        memory_windows,
+        benchmark,
+    ) = job
+    root = Path(root_str)
+    seed_results: dict[str, dict[str, Any]] = {}
+
+    for ablation_name, patch in _ablation_specs(tau_values, memory_windows):
+        payload = _deep_merge(base_payload, patch)
+        payload["problem"] = copy.deepcopy(benchmark_problem)
+        payload.setdefault("solver", {})["seed"] = seed
+        payload["solver"]["generations"] = generations
+        payload["solver"]["population_size"] = population_size
+        payload.setdefault("experiment", {})["seed"] = seed
+        payload["experiment"]["name"] = f"ablation_{ablation_name}_{benchmark}_seed{seed}"
+        payload["experiment"]["method"] = ablation_name
+        payload["experiment"]["benchmark"] = benchmark
+        payload.setdefault("logging", {})["output_dir"] = str(root / benchmark / f"seed_{seed}" / ablation_name)
+
+        tmp_path = root / benchmark / f"seed_{seed}" / f"{ablation_name}.tmp.yaml"
+        _dump_yaml(tmp_path, payload)
+        try:
+            seed_results[ablation_name] = run_experiment(str(tmp_path))
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+    return seed, seed_results
+
+
 def run_ablation_matrix(
     *,
     output_root: str | Path,
@@ -83,6 +130,7 @@ def run_ablation_matrix(
     population_size: int,
     tau_values: tuple[int, ...] = (1, 3, 5, 10),
     memory_windows: tuple[int, ...] = (5, 20, 50),
+    max_workers: int = 1,
 ) -> dict[str, dict[int, dict[str, dict[str, Any]]]]:
     """运行 基准问题 x 种子 x ablation 矩阵 从 该 规则-控制 base 配置."""
     base_payload = _load_yaml(_BASE_METHOD_CONFIG)
@@ -95,28 +143,42 @@ def run_ablation_matrix(
         benchmark_problem = _load_yaml(_BENCHMARK_CONFIGS[benchmark])["problem"]
         benchmark_results: dict[int, dict[str, dict[str, Any]]] = {}
 
-        for seed in seeds:
-            seed_results: dict[str, dict[str, Any]] = {}
-            for ablation_name, patch in _ablation_specs(tau_values, memory_windows):
-                payload = _deep_merge(base_payload, patch)
-                payload["problem"] = copy.deepcopy(benchmark_problem)
-                payload.setdefault("solver", {})["seed"] = seed
-                payload["solver"]["generations"] = generations
-                payload["solver"]["population_size"] = population_size
-                payload.setdefault("experiment", {})["seed"] = seed
-                payload["experiment"]["name"] = f"ablation_{ablation_name}_{benchmark}_seed{seed}"
-                payload["experiment"]["method"] = ablation_name
-                payload["experiment"]["benchmark"] = benchmark
-                payload.setdefault("logging", {})["output_dir"] = str(root / benchmark / f"seed_{seed}" / ablation_name)
-
-                tmp_path = root / benchmark / f"seed_{seed}" / f"{ablation_name}.tmp.yaml"
-                _dump_yaml(tmp_path, payload)
-                try:
-                    seed_results[ablation_name] = run_experiment(str(tmp_path))
-                finally:
-                    if tmp_path.exists():
-                        tmp_path.unlink()
-            benchmark_results[seed] = seed_results
+        seed_list = [int(seed) for seed in seeds]
+        if len(seed_list) <= 1 or max_workers == 1:
+            for seed in seed_list:
+                _, seed_results = _run_ablation_seed_job(
+                    (
+                        str(root),
+                        base_payload,
+                        benchmark_problem,
+                        seed,
+                        generations,
+                        population_size,
+                        tau_values,
+                        memory_windows,
+                        benchmark,
+                    )
+                )
+                benchmark_results[seed] = seed_results
+        else:
+            worker_count = _resolve_max_workers(max_workers, len(seed_list))
+            jobs = [
+                (
+                    str(root),
+                    base_payload,
+                    benchmark_problem,
+                    seed,
+                    generations,
+                    population_size,
+                    tau_values,
+                    memory_windows,
+                    benchmark,
+                )
+                for seed in seed_list
+            ]
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                for seed, seed_results in executor.map(_run_ablation_seed_job, jobs):
+                    benchmark_results[seed] = seed_results
         results[benchmark] = benchmark_results
     return results
 
